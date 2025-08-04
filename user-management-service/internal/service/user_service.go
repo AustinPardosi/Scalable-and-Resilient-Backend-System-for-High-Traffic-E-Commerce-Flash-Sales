@@ -25,3 +25,13 @@ func (s *UserService) CreateUser(user *entity.User) (*entity.User, error) {
 	user.ID = 1
 	return user, nil
 }
+
+// Login logs in a user with email and password
+func (s *UserService) Login(email, password string) (*entity.User, error) {
+	user := &entity.User{
+		ID:       1,
+		Username: "testuser",
+		Email:    email,
+	}
+	return user, nil
+}

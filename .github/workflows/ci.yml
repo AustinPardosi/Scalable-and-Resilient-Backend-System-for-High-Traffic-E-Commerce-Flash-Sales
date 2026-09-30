@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
+      fail-fast: false # one failing service shouldn't hide the others' results
       matrix:
         service: [user-management-service, product-catalog-service, order-service, pricing-service]
     services:
@@ -33,7 +34,10 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version-file: ${{ matrix.service }}/go.mod
+          # Same Go as the Dockerfile, on its newest patch release: go.mod's "go" line is only
+          # the minimum version, and building on an old patch fails govulncheck on fixed bugs.
+          go-version: "1.27"
+          check-latest: true
           cache-dependency-path: ${{ matrix.service }}/go.sum
       - name: Load example config
         run: grep -E '^[A-Z_]+=' ../.env.example >> "$GITHUB_ENV"

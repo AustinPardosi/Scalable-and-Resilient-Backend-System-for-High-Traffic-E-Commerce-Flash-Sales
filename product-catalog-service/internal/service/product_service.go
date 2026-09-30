@@ -1,66 +1,46 @@
 package service
 
 import (
-	"fmt"
-	"os"
+	"context"
+	"product-catalog-service/internal/entity"
+	"product-catalog-service/internal/events"
 	"product-catalog-service/internal/repository"
-
-	"github.com/rs/zerolog"
 )
 
-var logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
-
 type ProductService struct {
-	productRepo repository.ProductRepository
+	productRepo *repository.ProductRepository
+	publisher   *events.Publisher
 }
 
 // NewProductService creates a new instance of ProductService
-func NewProductService(repo repository.ProductRepository) *ProductService {
-	return &ProductService{productRepo: repo}
+func NewProductService(repo *repository.ProductRepository, publisher *events.Publisher) *ProductService {
+	return &ProductService{productRepo: repo, publisher: publisher}
 }
 
-// GetProductStock retrieves the stock for a product
-func (p *ProductService) GetProductStock(productID int) (int, error) {
-	product, err := p.productRepo.GetProductByID(productID)
-	if err != nil {
-		logger.Error().Err(err).Msgf("Error retrieving product by ID %d", productID)
-		return 0, err
-	}
-	return product.Stock, nil
+func (p *ProductService) GetProducts(ctx context.Context) ([]entity.Product, error) {
+	return p.productRepo.GetProducts(ctx)
 }
 
-// ReserveProductStock reserves stock for an order
-func (p *ProductService) ReserveProductStock(productID, quantity int) error {
-	product, err := p.productRepo.GetProductByID(productID)
+func (p *ProductService) GetProductByID(ctx context.Context, id int64) (*entity.Product, error) {
+	return p.productRepo.GetProductByID(ctx, id)
+}
+
+// Reserve takes stock for an order (all items or none) and announces the new levels
+func (p *ProductService) Reserve(ctx context.Context, orderID int64, items []entity.Item) error {
+	changed, err := p.productRepo.Reserve(ctx, orderID, items)
 	if err != nil {
-		logger.Error().Err(err).Msgf("Error retrieving product by ID %d", productID)
 		return err
 	}
-	if product.Stock < quantity {
-		logger.Warn().Msgf("Insufficient stock for product ID %d: requested %d, available %d", productID, quantity, product.Stock)
-		return fmt.Errorf("product out of stock")
-	}
-	product.Stock -= quantity
-	_, err = p.productRepo.UpdateProduct(product)
-	if err != nil {
-		logger.Error().Err(err).Msgf("Error updating product stock for ID %d", productID)
-		return err
-	}
+	p.publisher.StockChanged(changed)
 	return nil
 }
 
-// ReleaseProductStock releases reserved stock when an order is canceled
-func (p *ProductService) ReleaseProductStock(productID, quantity int) error {
-	product, err := p.productRepo.GetProductByID(productID)
+// Release gives a canceled order's stock back and announces the new levels
+func (p *ProductService) Release(ctx context.Context, orderID int64) error {
+	changed, err := p.productRepo.Release(ctx, orderID)
 	if err != nil {
-		logger.Error().Err(err).Msgf("Error retrieving product by ID %d", productID)
 		return err
 	}
-	product.Stock += quantity
-	_, err = p.productRepo.UpdateProduct(product)
-	if err != nil {
-		logger.Error().Err(err).Msgf("Error updating product stock for ID %d", productID)
-		return err
-	}
+	p.publisher.StockChanged(changed)
 	return nil
 }

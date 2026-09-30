@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        service: [user-management-service, product-catalog-service, order-service, pricing-service]
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-password # throwaway database
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-root-password"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    defaults:
+      run:
+        working-directory: ${{ matrix.service }}
+    steps:
+      # Actions pinned to commit SHAs: a moved tag can't change what runs here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: ${{ matrix.service }}/go.mod
+          cache-dependency-path: ${{ matrix.service }}/go.sum
+      - name: Load example config
+        run: grep -E '^[A-Z_]+=' ../.env.example >> "$GITHUB_ENV"
+      - name: Create databases and service logins
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-password
+          MYSQL_HOST: 127.0.0.1
+        run: |
+          for f in ../*/schema.sql; do MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -h "$MYSQL_HOST" -uroot < "$f"; done
+          bash ../db/create-logins.sh
+      - run: go vet ./...
+      - name: Known vulnerabilities in code we call
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - name: Test (integration tests hit the MySQL service)
+        run: |
+          export PRODUCTS_TEST_DSN="product_svc:${PRODUCT_DB_PASSWORD}@tcp(127.0.0.1:3306)/products_db"
+          export ORDERS_TEST_DSN="order_svc:${ORDER_DB_PASSWORD}@tcp(127.0.0.1:3306)/orders_db?parseTime=true"
+          go test -race ./...
+      - run: docker build --build-arg SERVICE=${{ matrix.service }} ..
+
+  # The whole stack under a flash-sale burst: fails the build if anything is oversold.
+  flash-sale:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: cp .env.example .env
+      - run: ./scripts/loadtest.sh
+      - if: failure()
+        run: docker compose logs --tail=200

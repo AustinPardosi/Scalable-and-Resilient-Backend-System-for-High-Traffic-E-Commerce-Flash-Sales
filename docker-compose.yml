@@ -1,100 +1,186 @@
-version: "3.8"
-
+# Local stack. Values come from .env: cp .env.example .env
+# Every port is published on 127.0.0.1 only, so nothing is reachable from your network.
 services:
     mysql:
-        image: mysql:8.0
-        container_name: mysql
+        image: mysql:8.4
         environment:
-            MYSQL_ROOT_PASSWORD: rootpassword
-            MYSQL_DATABASE: mydb
-            MYSQL_USER: user
-            MYSQL_PASSWORD: password
+            MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?see .env.example}
+            USER_DB_PASSWORD: ${USER_DB_PASSWORD:?see .env.example}
+            PRODUCT_DB_PASSWORD: ${PRODUCT_DB_PASSWORD:?see .env.example}
+            ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD:?see .env.example}
+        command: --max-connections=500
         ports:
-            - "3306:3306"
+            - "127.0.0.1:3306:3306"
         volumes:
             - mysql_data:/var/lib/mysql
+            # Runs only on an empty volume: after a schema change, `docker compose down -v`.
+            - ./user-management-service/schema.sql:/docker-entrypoint-initdb.d/1-users.sql:ro
+            - ./product-catalog-service/schema.sql:/docker-entrypoint-initdb.d/2-products.sql:ro
+            - ./order-service/schema.sql:/docker-entrypoint-initdb.d/3-orders.sql:ro
+            - ./db/create-logins.sh:/docker-entrypoint-initdb.d/9-logins.sh:ro
+        healthcheck:
+            test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 -uroot --silent"]
+            interval: 5s
+            timeout: 5s
+            retries: 30
 
-    zookeeper:
-        image: confluentinc/cp-zookeeper:7.4.0
-        container_name: zookeeper
-        environment:
-            ZOOKEEPER_CLIENT_PORT: 2181
-            ZOOKEEPER_TICK_TIME: 2000
+    # Single broker in KRaft mode (no ZooKeeper). Other containers use kafka:29092,
+    # tools on your machine use localhost:9092.
+    # ponytail: no authentication, which is fine on a private network; production needs SASL + ACLs.
+    kafka:
+        image: apache/kafka:4.1.2
         ports:
-            - "2181:2181"
-
-    kafka1:
-        image: confluentinc/cp-kafka:7.4.0
-        container_name: kafka1
-        depends_on:
-            - zookeeper
+            - "127.0.0.1:9092:9092"
         environment:
-            KAFKA_BROKER_ID: 1
-            KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-            KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+            CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw # any 16-byte base64url UUID
+            KAFKA_NODE_ID: 1
+            KAFKA_PROCESS_ROLES: broker,controller
+            KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+            KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+            KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+            KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+            KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+            KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
             KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-        ports:
-            - "9092:9092"
-        volumes:
-            - kafka1_data:/var/lib/kafka
+            KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+            KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+            KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+            KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+            KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+            KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+        healthcheck:
+            test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:29092 > /dev/null"]
+            interval: 10s
+            timeout: 10s
+            retries: 20
 
-    kafka2:
-        image: confluentinc/cp-kafka:7.4.0
-        container_name: kafka2
+    kafka-init:
+        image: apache/kafka:4.1.2
         depends_on:
-            - zookeeper
-        environment:
-            KAFKA_BROKER_ID: 2
-            KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-            KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9093
-            KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-        ports:
-            - "9093:9093"
-        volumes:
-            - kafka2_data:/var/lib/kafka
+            kafka:
+                condition: service_healthy
+        entrypoint:
+            - /bin/sh
+            - -c
+            - |
+                for t in order.created order.paid order.canceled stock.changed; do
+                  /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists \
+                    --topic $$t --partitions 3 --replication-factor 1 || exit 1
+                done
 
-    kafka3:
-        image: confluentinc/cp-kafka:7.4.0
-        container_name: kafka3
-        depends_on:
-            - zookeeper
-        environment:
-            KAFKA_BROKER_ID: 3
-            KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-            KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9094
-            KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    # No login and it can publish messages, so it's opt-in and localhost-only:
+    # docker compose --profile debug up -d kafka-ui
+    kafka-ui:
+        image: kafbat/kafka-ui:v1.5.0
+        profiles: [debug]
         ports:
-            - "9094:9094"
-        volumes:
-            - kafka3_data:/var/lib/kafka
-
-    kafkaui:
-        image: provectuslabs/kafka-ui:latest
-        container_name: kafkaui
-        depends_on:
-            - kafka1
-            - kafka2
-            - kafka3
-        ports:
-            - "8080:8080"
+            - "127.0.0.1:8090:8080"
         environment:
             KAFKA_CLUSTERS_0_NAME: local
-            KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:9092,kafka2:9093,kafka3:9094
+            KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+        depends_on:
+            kafka:
+                condition: service_healthy
 
+    # Holds the prices orders are charged at, so it gets a password too.
     redis:
-        image: redis:latest
-        container_name: redis
+        image: redis:8.8-alpine
+        command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?see .env.example}"]
+        environment:
+            REDISCLI_AUTH: ${REDIS_PASSWORD:?see .env.example} # lets redis-cli in this container log in
         ports:
-            - "6379:6379"
+            - "127.0.0.1:6379:6379"
+        healthcheck:
+            test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+
+    user-service:
+        build:
+            context: .
+            args:
+                SERVICE: user-management-service
+        restart: on-failure
+        ports:
+            - "127.0.0.1:8080:8080"
+        environment:
+            DB_DSN: user_svc:${USER_DB_PASSWORD:?see .env.example}@tcp(mysql:3306)/users_db?parseTime=true
+            JWT_SECRET: ${JWT_SECRET:?see .env.example}
+        depends_on:
+            mysql:
+                condition: service_healthy
+
+    product-service:
+        build:
+            context: .
+            args:
+                SERVICE: product-catalog-service
+        restart: on-failure
+        ports:
+            - "127.0.0.1:8081:8081"
+        environment:
+            DB_DSN: product_svc:${PRODUCT_DB_PASSWORD:?see .env.example}@tcp(mysql:3306)/products_db?parseTime=true
+            KAFKA_BROKERS: kafka:29092
+            INTERNAL_TOKEN: ${INTERNAL_TOKEN:?see .env.example}
+        depends_on:
+            mysql:
+                condition: service_healthy
+            kafka-init:
+                condition: service_completed_successfully
+
+    order-service:
+        build:
+            context: .
+            args:
+                SERVICE: order-service
+        restart: on-failure
+        ports:
+            - "127.0.0.1:8082:8082"
+        environment:
+            DB_DSN: order_svc:${ORDER_DB_PASSWORD:?see .env.example}@tcp(mysql:3306)/orders_db?parseTime=true
+            KAFKA_BROKERS: kafka:29092
+            JWT_SECRET: ${JWT_SECRET:?see .env.example}
+            INTERNAL_TOKEN: ${INTERNAL_TOKEN:?see .env.example}
+            PRODUCT_SERVICE_URL: http://product-service:8081
+            PRICING_SERVICE_URL: http://pricing-service:8083
+        depends_on:
+            mysql:
+                condition: service_healthy
+            kafka-init:
+                condition: service_completed_successfully
+
+    pricing-service:
+        build:
+            context: .
+            args:
+                SERVICE: pricing-service
+        restart: on-failure
+        ports:
+            - "127.0.0.1:8083:8083"
+        environment:
+            REDIS_ADDR: redis:6379
+            REDIS_PASSWORD: ${REDIS_PASSWORD:?see .env.example}
+            KAFKA_BROKERS: kafka:29092
+            PRODUCT_SERVICE_URL: http://product-service:8081
+        depends_on:
+            redis:
+                condition: service_healthy
+            kafka-init:
+                condition: service_completed_successfully
+
+    # Load test, only on demand: ./scripts/loadtest.sh
+    k6:
+        image: grafana/k6:1.8.1
+        profiles: [loadtest]
         volumes:
-            - redis_data:/data
+            - ./loadtest:/scripts:ro
+        command: run /scripts/flash-sale.js
+        depends_on:
+            - user-service
+            - product-service
+            - order-service
+            - pricing-service
 
 volumes:
     mysql_data:
-    kafka1_data:
-    kafka2_data:
-    kafka3_data:
-    redis_data:

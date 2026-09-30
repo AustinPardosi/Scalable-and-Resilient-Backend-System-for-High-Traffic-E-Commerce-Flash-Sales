@@ -1,47 +1,59 @@
 package repository
 
-import "user-management-service/internal/entity"
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"user-management-service/internal/entity"
+
+	"github.com/go-sql-driver/mysql"
+)
+
+var (
+	ErrNotFound  = errors.New("user not found")
+	ErrDuplicate = errors.New("email already registered")
+)
 
 type UserRepository struct {
+	db *sql.DB
 }
 
-func NewUserRepository() *UserRepository {
-	return &UserRepository{}
+func NewUserRepository(db *sql.DB) *UserRepository {
+	return &UserRepository{db: db}
 }
 
-var users = map[int]*entity.User{
-	1: {ID: 1, Username: "John Doe", Email: "john.doe@example.com"},
-	2: {ID: 2, Username: "Jane Smith", Email: "jane.smith@example.com"},
-}
+func (r *UserRepository) CreateUser(ctx context.Context, user *entity.User) error {
+	res, err := r.db.ExecContext(ctx,
+		`INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)`,
+		user.Username, user.Email, user.PasswordHash)
+	var me *mysql.MySQLError
+	if errors.As(err, &me) && me.Number == 1062 { // duplicate key on email
 
-func (r *UserRepository) GetUserByID(id int) (*entity.User, error) {
-	user, exists := users[id]
-	if !exists {
-		return nil, nil
+		return ErrDuplicate
 	}
-	return user, nil
-}
-
-func (r *UserRepository) CreateUser(user *entity.User) (*entity.User, error) {
-	user.ID = len(users) + 1
-	users[user.ID] = user
-	return user, nil
-}
-
-func (r *UserRepository) GetUserByEmail(email string) (*entity.User, error) {
-	for _, user := range users {
-		if user.Email == email {
-			return user, nil
-		}
+	if err != nil {
+		return err
 	}
-	return nil, nil
+	user.ID, err = res.LastInsertId()
+	return err
 }
 
-func (r *UserRepository) GetUserByEmailAndPassword(email, password string) (*entity.User, error) {
-	for _, user := range users {
-		if user.Email == email && user.Password == password {
-			return user, nil
-		}
+func (r *UserRepository) GetUserByID(ctx context.Context, id int64) (*entity.User, error) {
+	return r.getOne(ctx, `SELECT id, username, email, password_hash FROM users WHERE id = ?`, id)
+}
+
+func (r *UserRepository) GetUserByEmail(ctx context.Context, email string) (*entity.User, error) {
+	return r.getOne(ctx, `SELECT id, username, email, password_hash FROM users WHERE email = ?`, email)
+}
+
+func (r *UserRepository) getOne(ctx context.Context, query string, arg any) (*entity.User, error) {
+	var u entity.User
+	err := r.db.QueryRowContext(ctx, query, arg).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
 	}
-	return nil, nil
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
 }
